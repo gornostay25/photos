@@ -1,4 +1,4 @@
-import { mkdir, unlink } from 'node:fs/promises';
+import { unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { encrypt } from './crypto';
 import type { AssetType } from './scanner';
@@ -48,9 +48,6 @@ export async function createChunks(
 	outputDir: string,
 	encryptionKey: CryptoKey
 ): Promise<ChunkInfo[]> {
-	const chunksDir = join(outputDir, 'chunks');
-	await mkdir(chunksDir, { recursive: true });
-
 	const chunks: ChunkInfo[] = [];
 	let chunkId = 0;
 	let chunkStartIndex = 0;
@@ -89,31 +86,31 @@ export async function createChunks(
 			thumbFiles['meta.json'] = new TextEncoder().encode(JSON.stringify(metaEntries));
 
 			// Write thumbnails chunk
-			const thumbnailsFile = `chunks/thumbs-${chunkId}.enc`;
+			const thumbnailsFile = `thumbs-${chunkId}.enc`;
 			await writeEncryptedArchive(
 				thumbFiles,
 				join(outputDir, thumbnailsFile),
-				join(chunksDir, `_tmp_thumbs_${chunkId}`),
+				join(outputDir, `_tmp_thumbs_${chunkId}`),
 				encryptionKey
 			);
 
 			// Write originals chunk
-			const originalsFile = `chunks/originals-${chunkId}.enc`;
+			const originalsFile = `originals-${chunkId}.enc`;
 			await writeEncryptedArchive(
 				assetFiles,
 				join(outputDir, originalsFile),
-				join(chunksDir, `_tmp_assets_${chunkId}`),
+				join(outputDir, `_tmp_assets_${chunkId}`),
 				encryptionKey
 			);
 
 			// Write videos chunk (only if there are videos)
 			let videosFile: string | null = null;
 			if (Object.keys(videoFiles).length > 0) {
-				videosFile = `chunks/videos-${chunkId}.enc`;
+				videosFile = `videos-${chunkId}.enc`;
 				await writeEncryptedArchive(
 					videoFiles,
 					join(outputDir, videosFile),
-					join(chunksDir, `_tmp_videos_${chunkId}`),
+					join(outputDir, `_tmp_videos_${chunkId}`),
 					encryptionKey
 				);
 			}

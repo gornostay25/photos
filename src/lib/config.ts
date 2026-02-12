@@ -3,5 +3,5 @@
  * Album files are expected at /<albumName>/
  */
 export function buildAlbumUrl(albumName: string): string {
-	return `/gallery/${encodeURIComponent(albumName)}/`;
+	return `https://assets.gornostay25.dev/photos/${encodeURIComponent(albumName)}/`;
 }
