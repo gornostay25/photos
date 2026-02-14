@@ -3,15 +3,19 @@ import { join } from 'node:path';
 import { encrypt } from './crypto';
 import type { AssetType } from './scanner';
 
-const MAX_CHUNK_SIZE = 2 * 1024 * 1024 * 1024; // 2GB
+const MAX_CHUNK_SIZE = 500 * 1024 * 1024; // 500MB per chunk (tar+gzip+encrypt needs ~3-4x in RAM)
 
+/**
+ * A chunk entry referencing files on disk (not in-memory buffers).
+ * This allows processing large collections without OOM.
+ */
 export interface ChunkEntry {
 	id: number;
 	type: AssetType;
 	date: string; // ISO date string
-	thumbnail: Uint8Array;
-	asset: Uint8Array | null; // null for video-only
-	video: Uint8Array | null; // null for photo-only
+	thumbnailPath: string;
+	assetPath: string | null; // null for video-only
+	videoPath: string | null; // null for photo-only
 }
 
 export interface ChunkInfo {
@@ -40,7 +44,8 @@ async function writeEncryptedArchive(
 }
 
 /**
- * Create chunked, encrypted archives from converted assets.
+ * Create chunked, encrypted archives from converted assets on disk.
+ * Reads files lazily per chunk to keep memory usage bounded.
  * Produces three files per chunk: thumbnails (with meta.json), originals, and videos.
  */
 export async function createChunks(
@@ -53,35 +58,45 @@ export async function createChunks(
 	let chunkStartIndex = 0;
 	let currentAssetSize = 0;
 
-	let thumbFiles: Record<string, Uint8Array> = {};
-	let assetFiles: Record<string, Uint8Array> = {};
-	let videoFiles: Record<string, Uint8Array> = {};
-	let metaEntries: Record<string, { date: string; type: AssetType }> = {};
+	// Accumulate paths for the current chunk, read them only when flushing
+	let chunkEntries: ChunkEntry[] = [];
 
 	for (let i = 0; i < entries.length; i++) {
 		const entry = entries[i];
+		chunkEntries.push(entry);
 
-		// Thumbnail (always present)
-		thumbFiles[`thumb${entry.id}.avif`] = entry.thumbnail;
-
-		// Photo/live-photo original
-		if (entry.asset) {
-			assetFiles[`asset${entry.id}.avif`] = entry.asset;
-			currentAssetSize += entry.asset.byteLength;
+		// Count ALL file sizes toward chunk budget (assets + videos)
+		if (entry.assetPath) {
+			currentAssetSize += Bun.file(entry.assetPath).size;
 		}
-
-		// Video (standalone or live-photo video part)
-		if (entry.video) {
-			videoFiles[`video${entry.id}.mp4`] = entry.video;
+		if (entry.videoPath) {
+			currentAssetSize += Bun.file(entry.videoPath).size;
 		}
-
-		// Metadata
-		metaEntries[String(entry.id)] = { date: entry.date, type: entry.type };
 
 		const isLast = i === entries.length - 1;
 		const chunkFull = currentAssetSize >= MAX_CHUNK_SIZE;
 
 		if (chunkFull || isLast) {
+			// Read files for this chunk into memory, build tar, write, then release
+			const thumbFiles: Record<string, Uint8Array> = {};
+			const assetFiles: Record<string, Uint8Array> = {};
+			const videoFiles: Record<string, Uint8Array> = {};
+			const metaEntries: Record<string, { date: string; type: AssetType }> = {};
+
+			for (const e of chunkEntries) {
+				thumbFiles[`thumb${e.id}.avif`] = await Bun.file(e.thumbnailPath).bytes();
+
+				if (e.assetPath) {
+					assetFiles[`asset${e.id}.avif`] = await Bun.file(e.assetPath).bytes();
+				}
+
+				if (e.videoPath) {
+					videoFiles[`video${e.id}.mp4`] = await Bun.file(e.videoPath).bytes();
+				}
+
+				metaEntries[String(e.id)] = { date: e.date, type: e.type };
+			}
+
 			// Add meta.json to thumbnails archive
 			thumbFiles['meta.json'] = new TextEncoder().encode(JSON.stringify(metaEntries));
 
@@ -121,16 +136,13 @@ export async function createChunks(
 				originalsFile,
 				videosFile,
 				startIndex: chunkStartIndex,
-				endIndex: entry.id
+				endIndex: chunkEntries[chunkEntries.length - 1].id
 			});
 
 			chunkId++;
-			chunkStartIndex = entry.id + 1;
+			chunkStartIndex = chunkEntries[chunkEntries.length - 1].id + 1;
 			currentAssetSize = 0;
-			thumbFiles = {};
-			assetFiles = {};
-			videoFiles = {};
-			metaEntries = {};
+			chunkEntries = [];
 		}
 	}
 

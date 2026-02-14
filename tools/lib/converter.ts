@@ -1,23 +1,8 @@
 import { $ } from 'bun';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { unlink } from 'node:fs/promises';
-
-export interface ConvertedPhoto {
-	image: Uint8Array;
-	thumbnail: Uint8Array;
-}
-
-export interface ConvertedVideo {
-	video: Uint8Array;
-	thumbnail: Uint8Array;
-}
-
-export interface ConvertedLivePhoto {
-	image: Uint8Array;
-	video: Uint8Array;
-	thumbnail: Uint8Array;
-}
+import { join, extname } from 'node:path';
+import { unlink, rename } from 'node:fs/promises';
+import exifr from 'exifr';
 
 // Quality settings
 const IMAGE_CRF = 23;
@@ -25,82 +10,144 @@ const THUMB_CRF = 32;
 const VIDEO_CRF = 28;
 const THUMB_SIZE = 256;
 
+// Extensions that need sips pre-decode (ffmpeg can't handle HEIC grid images)
+const SIPS_EXTENSIONS = new Set(['.heic', '.heif']);
+
 /**
- * Convert a source image to AVIF (full + thumbnail) using ffmpeg.
+ * Decode an image to a lossless PNG intermediate using macOS sips.
+ * Required for HEIC files where ffmpeg only sees 512x512 grid tiles.
+ * Also applies EXIF rotation to pixels using exifr + sips -r.
+ * For non-HEIC formats, returns the original path (no conversion needed).
  */
-export async function convertPhoto(sourcePath: string, id: number): Promise<ConvertedPhoto> {
+async function decodeImage(
+	sourcePath: string,
+	id: number
+): Promise<{ path: string; temp: boolean }> {
+	const ext = extname(sourcePath).toLowerCase();
+	if (!SIPS_EXTENSIONS.has(ext)) {
+		return { path: sourcePath, temp: false };
+	}
+
+	// Read rotation from EXIF using exifr (sips -g orientation returns <nil> for HEIC)
+	let rotateDeg = 0;
+	try {
+		const rotation = await exifr.rotation(sourcePath);
+		if (rotation && rotation.deg) {
+			rotateDeg = rotation.deg;
+		}
+	} catch {
+		/* no rotation info available */
+	}
+
 	const tmp = tmpdir();
-	const imagePath = join(tmp, `photo_${id}.avif`);
-	const thumbPath = join(tmp, `thumb_${id}.avif`);
+	const pngPath = join(tmp, `decoded_${id}.png`);
+
+	// Decode HEIC to full-resolution PNG
+	await $`sips -s format png ${sourcePath} --out ${pngPath}`.quiet();
+
+	// Apply rotation to pixels (sips -s format png does NOT bake in orientation)
+	if (rotateDeg !== 0) {
+		await $`sips -r ${rotateDeg} ${pngPath}`.quiet();
+	}
+
+	return { path: pngPath, temp: true };
+}
+
+// ── Cache file naming helpers ────────────────────────────────────
+
+export function thumbCacheName(id: number): string {
+	return `${id}.thumb.avif`;
+}
+export function assetCacheName(id: number): string {
+	return `${id}.asset.avif`;
+}
+export function videoCacheName(id: number): string {
+	return `${id}.video.mp4`;
+}
+
+// ── Convert-to-directory variants (write to cache, no memory) ───
+
+/**
+ * Convert a photo to AVIF (full + thumbnail) and write to cacheDir.
+ * Produces: <id>.thumb.avif, <id>.asset.avif
+ */
+export async function convertPhotoToDir(
+	sourcePath: string,
+	id: number,
+	cacheDir: string
+): Promise<void> {
+	const tmp = tmpdir();
+	const tmpImage = join(tmp, `photo_${id}.avif`);
+	const tmpThumb = join(tmp, `thumb_${id}.avif`);
+	const decoded = await decodeImage(sourcePath, id);
 
 	try {
-		await $`ffmpeg -y -autorotate -i ${sourcePath} -c:v libsvtav1 -crf ${IMAGE_CRF} -preset 6 -pix_fmt yuv420p10le -frames:v 1 ${imagePath}`.quiet();
-		await $`ffmpeg -y -autorotate -i ${sourcePath} -vf scale=${THUMB_SIZE}:${THUMB_SIZE}:force_original_aspect_ratio=decrease -c:v libsvtav1 -crf ${THUMB_CRF} -preset 6 -pix_fmt yuv420p10le -frames:v 1 ${thumbPath}`.quiet();
+		await $`ffmpeg -y -autorotate -i ${decoded.path} -c:v libsvtav1 -crf ${IMAGE_CRF} -preset 6 -pix_fmt yuv420p10le -frames:v 1 ${tmpImage}`.quiet();
+		await $`ffmpeg -y -autorotate -i ${decoded.path} -vf scale=${THUMB_SIZE}:${THUMB_SIZE}:force_original_aspect_ratio=decrease -c:v libsvtav1 -crf ${THUMB_CRF} -preset 6 -pix_fmt yuv420p10le -frames:v 1 ${tmpThumb}`.quiet();
 
-		const image = await Bun.file(imagePath).bytes();
-		const thumbnail = await Bun.file(thumbPath).bytes();
-		return { image, thumbnail };
+		// Move to cache (atomic-ish: write to tmp first, then rename)
+		await rename(tmpThumb, join(cacheDir, thumbCacheName(id)));
+		await rename(tmpImage, join(cacheDir, assetCacheName(id)));
 	} finally {
-		await unlink(imagePath).catch(() => {});
-		await unlink(thumbPath).catch(() => {});
+		await unlink(tmpImage).catch(() => {});
+		await unlink(tmpThumb).catch(() => {});
+		if (decoded.temp) await unlink(decoded.path).catch(() => {});
 	}
 }
 
 /**
- * Convert a video to AV1 MP4 + generate AVIF thumbnail from a frame.
+ * Convert a video to AV1 MP4 + AVIF thumbnail and write to cacheDir.
+ * Produces: <id>.thumb.avif, <id>.video.mp4
  */
-export async function convertVideo(sourcePath: string, id: number): Promise<ConvertedVideo> {
+export async function convertVideoToDir(
+	sourcePath: string,
+	id: number,
+	cacheDir: string
+): Promise<void> {
 	const tmp = tmpdir();
-	const videoPath = join(tmp, `video_${id}.mp4`);
-	const thumbPath = join(tmp, `vthumb_${id}.avif`);
+	const tmpVideo = join(tmp, `video_${id}.mp4`);
+	const tmpThumb = join(tmp, `vthumb_${id}.avif`);
 
 	try {
-		// Encode video to AV1 MP4 with Opus audio
-		await $`ffmpeg -y -i ${sourcePath} -c:v libsvtav1 -crf ${VIDEO_CRF} -preset 6 -pix_fmt yuv420p10le -c:a libopus -b:a 96k ${videoPath}`.quiet();
+		await $`ffmpeg -y -i ${sourcePath} -c:v libsvtav1 -crf ${VIDEO_CRF} -preset 6 -pix_fmt yuv420p10le -c:a libopus -b:a 96k ${tmpVideo}`.quiet();
+		await $`ffmpeg -y -i ${sourcePath} -vf thumbnail,scale=${THUMB_SIZE}:${THUMB_SIZE}:force_original_aspect_ratio=decrease -frames:v 1 -c:v libsvtav1 -crf ${THUMB_CRF} -preset 6 -pix_fmt yuv420p10le ${tmpThumb}`.quiet();
 
-		// Generate thumbnail from a representative frame
-		await $`ffmpeg -y -i ${sourcePath} -vf thumbnail,scale=${THUMB_SIZE}:${THUMB_SIZE}:force_original_aspect_ratio=decrease -frames:v 1 -c:v libsvtav1 -crf ${THUMB_CRF} -preset 6 -pix_fmt yuv420p10le ${thumbPath}`.quiet();
-
-		const video = await Bun.file(videoPath).bytes();
-		const thumbnail = await Bun.file(thumbPath).bytes();
-		return { video, thumbnail };
+		await rename(tmpThumb, join(cacheDir, thumbCacheName(id)));
+		await rename(tmpVideo, join(cacheDir, videoCacheName(id)));
 	} finally {
-		await unlink(videoPath).catch(() => {});
-		await unlink(thumbPath).catch(() => {});
+		await unlink(tmpVideo).catch(() => {});
+		await unlink(tmpThumb).catch(() => {});
 	}
 }
 
 /**
- * Convert a live photo pair (image + video) to AVIF still + AV1 MP4 video.
- * Thumbnail is generated from the still image.
+ * Convert a live photo pair (image + video) and write to cacheDir.
+ * Produces: <id>.thumb.avif, <id>.asset.avif, <id>.video.mp4
  */
-export async function convertLivePhoto(
+export async function convertLivePhotoToDir(
 	imageSrc: string,
 	videoSrc: string,
-	id: number
-): Promise<ConvertedLivePhoto> {
+	id: number,
+	cacheDir: string
+): Promise<void> {
 	const tmp = tmpdir();
-	const imagePath = join(tmp, `live_img_${id}.avif`);
-	const thumbPath = join(tmp, `live_thumb_${id}.avif`);
-	const videoPath = join(tmp, `live_vid_${id}.mp4`);
+	const tmpImage = join(tmp, `live_img_${id}.avif`);
+	const tmpThumb = join(tmp, `live_thumb_${id}.avif`);
+	const tmpVideo = join(tmp, `live_vid_${id}.mp4`);
+	const decoded = await decodeImage(imageSrc, id + 100000);
 
 	try {
-		// Still image
-		await $`ffmpeg -y -autorotate -i ${imageSrc} -c:v libsvtav1 -crf ${IMAGE_CRF} -preset 6 -pix_fmt yuv420p10le -frames:v 1 ${imagePath}`.quiet();
+		await $`ffmpeg -y -autorotate -i ${decoded.path} -c:v libsvtav1 -crf ${IMAGE_CRF} -preset 6 -pix_fmt yuv420p10le -frames:v 1 ${tmpImage}`.quiet();
+		await $`ffmpeg -y -autorotate -i ${decoded.path} -vf scale=${THUMB_SIZE}:${THUMB_SIZE}:force_original_aspect_ratio=decrease -c:v libsvtav1 -crf ${THUMB_CRF} -preset 6 -pix_fmt yuv420p10le -frames:v 1 ${tmpThumb}`.quiet();
+		await $`ffmpeg -y -i ${videoSrc} -c:v libsvtav1 -crf ${VIDEO_CRF} -preset 6 -pix_fmt yuv420p10le -c:a libopus -b:a 96k ${tmpVideo}`.quiet();
 
-		// Thumbnail from still image
-		await $`ffmpeg -y -autorotate -i ${imageSrc} -vf scale=${THUMB_SIZE}:${THUMB_SIZE}:force_original_aspect_ratio=decrease -c:v libsvtav1 -crf ${THUMB_CRF} -preset 6 -pix_fmt yuv420p10le -frames:v 1 ${thumbPath}`.quiet();
-
-		// Video part to AV1 MP4
-		await $`ffmpeg -y -i ${videoSrc} -c:v libsvtav1 -crf ${VIDEO_CRF} -preset 6 -pix_fmt yuv420p10le -c:a libopus -b:a 96k ${videoPath}`.quiet();
-
-		const image = await Bun.file(imagePath).bytes();
-		const thumbnail = await Bun.file(thumbPath).bytes();
-		const video = await Bun.file(videoPath).bytes();
-		return { image, video, thumbnail };
+		await rename(tmpThumb, join(cacheDir, thumbCacheName(id)));
+		await rename(tmpImage, join(cacheDir, assetCacheName(id)));
+		await rename(tmpVideo, join(cacheDir, videoCacheName(id)));
 	} finally {
-		await unlink(imagePath).catch(() => {});
-		await unlink(thumbPath).catch(() => {});
-		await unlink(videoPath).catch(() => {});
+		await unlink(tmpImage).catch(() => {});
+		await unlink(tmpThumb).catch(() => {});
+		await unlink(tmpVideo).catch(() => {});
+		if (decoded.temp) await unlink(decoded.path).catch(() => {});
 	}
 }

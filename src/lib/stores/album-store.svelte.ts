@@ -153,6 +153,8 @@ export class AlbumStore {
 					group.assets[i] = { ...asset, date: m.date, type: m.type };
 				}
 			}
+			// Sort newest first within the month
+			group.assets.sort((a, b) => b.date.localeCompare(a.date));
 		}
 		// Trigger Svelte reactivity by creating a new array reference
 		this.groups = [...this.groups];

@@ -1,11 +1,18 @@
 /// <reference types="@types/bun" />
 
 import { argv } from 'bun';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, rm, readFile, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { availableParallelism } from 'node:os';
 import { scanAssets, type ScannedAsset } from './lib/scanner';
-import { convertPhoto, convertVideo, convertLivePhoto } from './lib/converter';
+import {
+	convertPhotoToDir,
+	convertVideoToDir,
+	convertLivePhotoToDir,
+	thumbCacheName,
+	assetCacheName,
+	videoCacheName
+} from './lib/converter';
 import { createChunks, type ChunkEntry } from './lib/chunker';
 import { generateManifest } from './lib/manifest';
 import { deriveKey, encrypt } from './lib/crypto';
@@ -33,6 +40,48 @@ async function mapParallel<T, R>(
 
 	await Promise.all(Array.from({ length: concurrency }, () => worker()));
 	return results;
+}
+
+// ── Progress persistence ──────────────────────────────────────────
+
+interface ProgressFile {
+	sources: string[]; // ordered source paths from scan
+	completed: number[]; // asset IDs that are fully converted
+}
+
+async function loadProgress(progressPath: string): Promise<ProgressFile | null> {
+	try {
+		const raw = await readFile(progressPath, 'utf-8');
+		return JSON.parse(raw) as ProgressFile;
+	} catch {
+		return null;
+	}
+}
+
+async function saveProgress(progressPath: string, progress: ProgressFile): Promise<void> {
+	await writeFile(progressPath, JSON.stringify(progress));
+}
+
+/**
+ * Build the deterministic source key for each scanned asset.
+ * Used to detect if the source directory changed since last run.
+ */
+function sourceKey(asset: ScannedAsset): string {
+	if (asset.imagePath && asset.videoPath) return `${asset.imagePath}|${asset.videoPath}`;
+	return asset.imagePath ?? asset.videoPath ?? '';
+}
+
+// ── Time formatting ───────────────────────────────────────────────
+
+function formatDuration(ms: number): string {
+	const s = Math.floor(ms / 1000);
+	if (s < 60) return `${s}s`;
+	const m = Math.floor(s / 60);
+	const rs = s % 60;
+	if (m < 60) return `${m}m ${rs}s`;
+	const h = Math.floor(m / 60);
+	const rm = m % 60;
+	return `${h}h ${rm}m`;
 }
 
 // ── CLI argument parsing ──────────────────────────────────────────
@@ -72,6 +121,8 @@ if (!sourceDir || !password || !albumName) {
 
 const resolvedSource = resolve(sourceDir);
 const albumDir = resolve(join(outputPath, albumName));
+const cacheDir = join(albumDir, '.cache');
+const progressPath = join(albumDir, '.progress.json');
 
 console.log(`Source: ${resolvedSource}`);
 console.log(`Album:  ${albumName}`);
@@ -79,9 +130,7 @@ console.log(`Output: ${albumDir}\n`);
 
 // Step 1: Scan and sort by date
 console.log('Scanning for assets...');
-const scanned = await scanAssets(resolvedSource).then((assets) => {
-	return assets.splice(0, 30);
-});
+const scanned = await scanAssets(resolvedSource);
 
 const photoCount = scanned.filter((a) => a.type === 'photo').length;
 const liveCount = scanned.filter((a) => a.type === 'live').length;
@@ -95,83 +144,139 @@ if (scanned.length === 0) {
 	process.exit(0);
 }
 
-// Step 2: Derive encryption key
+// Step 2: Check for existing progress (resume support)
+await mkdir(cacheDir, { recursive: true });
+
+const currentSources = scanned.map(sourceKey);
+let progress = await loadProgress(progressPath);
+let completedSet: Set<number>;
+
+if (progress && JSON.stringify(progress.sources) === JSON.stringify(currentSources)) {
+	completedSet = new Set(progress.completed);
+	const remaining = scanned.length - completedSet.size;
+	console.log(`\nResuming: ${completedSet.size} already converted, ${remaining} remaining`);
+} else {
+	if (progress) {
+		console.log('\nSource files changed since last run — starting fresh');
+		await rm(cacheDir, { recursive: true, force: true });
+		await mkdir(cacheDir, { recursive: true });
+	}
+	completedSet = new Set();
+	progress = { sources: currentSources, completed: [] };
+	await saveProgress(progressPath, progress);
+}
+
+// Step 3: Derive encryption key
 console.log('\nDeriving encryption key...');
 const key = await deriveKey(password, albumName);
 
-// Step 3: Convert assets in parallel
+// Step 4: Convert assets in parallel (with resume skip)
 const concurrency = jobs ?? availableParallelism();
-console.log(`\nConverting assets (${concurrency} parallel jobs)...`);
-await mkdir(albumDir, { recursive: true });
+const toConvert = scanned
+	.map((asset, i) => ({ asset, id: i }))
+	.filter(({ id }) => !completedSet.has(id));
 
+console.log(`\nConverting ${toConvert.length} assets (${concurrency} parallel jobs)...`);
+
+const startTime = performance.now();
 let done = 0;
+let convertErrors = 0;
 
-const results = await mapParallel(scanned, concurrency, async (asset: ScannedAsset, i: number) => {
-	const label = asset.imagePath ?? asset.videoPath ?? '?';
+// Mutex for progress file writes
+let progressDirty = false;
+let progressWriting = false;
 
-	let entry: ChunkEntry;
-
-	if (asset.type === 'photo' && asset.imagePath) {
-		const c = await convertPhoto(asset.imagePath, i);
-		entry = {
-			id: i,
-			type: 'photo',
-			date: asset.date.toISOString(),
-			thumbnail: c.thumbnail,
-			asset: c.image,
-			video: null
-		};
-	} else if (asset.type === 'live' && asset.imagePath && asset.videoPath) {
-		const c = await convertLivePhoto(asset.imagePath, asset.videoPath, i);
-		entry = {
-			id: i,
-			type: 'live',
-			date: asset.date.toISOString(),
-			thumbnail: c.thumbnail,
-			asset: c.image,
-			video: c.video
-		};
-	} else if (asset.type === 'video' && asset.videoPath) {
-		const c = await convertVideo(asset.videoPath, i);
-		entry = {
-			id: i,
-			type: 'video',
-			date: asset.date.toISOString(),
-			thumbnail: c.thumbnail,
-			asset: null,
-			video: c.video
-		};
-	} else {
-		throw new Error('unexpected asset configuration');
+async function flushProgress() {
+	if (!progress) return;
+	if (progressWriting) {
+		progressDirty = true;
+		return;
 	}
-
-	const n = ++done;
-	console.log(`[${n}/${scanned.length}] ✓ [${asset.type}] ${label}`);
-	return { entry, date: asset.date };
-});
-
-// Collect successful results, preserving original order by id
-const entries: ChunkEntry[] = [];
-const dates: Date[] = [];
-let errors = 0;
-
-for (let i = 0; i < results.length; i++) {
-	const r = results[i];
-	if (r instanceof Error) {
-		const label = scanned[i].imagePath ?? scanned[i].videoPath ?? '?';
-		console.error(`✗ ${label}: ${r.message}`);
-		errors++;
-	} else {
-		entries.push(r.entry);
-		dates.push(r.date);
+	progressWriting = true;
+	try {
+		await saveProgress(progressPath, progress);
+		while (progressDirty) {
+			progressDirty = false;
+			await saveProgress(progressPath, progress);
+		}
+	} finally {
+		progressWriting = false;
 	}
 }
 
+if (toConvert.length > 0) {
+	await mapParallel(toConvert, concurrency, async ({ asset, id }) => {
+		const label = asset.imagePath ?? asset.videoPath ?? '?';
+
+		try {
+			if (asset.type === 'photo' && asset.imagePath) {
+				await convertPhotoToDir(asset.imagePath, id, cacheDir);
+			} else if (asset.type === 'live' && asset.imagePath && asset.videoPath) {
+				await convertLivePhotoToDir(asset.imagePath, asset.videoPath, id, cacheDir);
+			} else if (asset.type === 'video' && asset.videoPath) {
+				await convertVideoToDir(asset.videoPath, id, cacheDir);
+			} else {
+				throw new Error('unexpected asset configuration');
+			}
+
+			// Mark as completed
+			completedSet.add(id);
+			progress!.completed.push(id);
+			flushProgress(); // fire-and-forget, batched
+
+			const n = ++done;
+			const elapsed = performance.now() - startTime;
+			const avgMs = elapsed / n;
+			const remaining = toConvert.length - n;
+			const eta = formatDuration(avgMs * remaining);
+
+			console.log(
+				`[${completedSet.size}/${scanned.length}] ✓ [${asset.type}] ${label}  (ETA: ${eta})`
+			);
+		} catch (err) {
+			convertErrors++;
+			const msg = err instanceof Error ? err.message : String(err);
+			console.error(`[${asset.type}] ✗ ${label}: ${msg}`);
+			throw err;
+		}
+	});
+
+	// Final flush
+	await saveProgress(progressPath, progress);
+}
+
+const totalConverted = completedSet.size;
+const elapsed = formatDuration(performance.now() - startTime);
 console.log(
-	`\nConverted ${entries.length}/${scanned.length} assets${errors > 0 ? ` (${errors} failed)` : ''}`
+	`\nConversion done: ${totalConverted}/${scanned.length} assets in ${elapsed}` +
+		(convertErrors > 0 ? ` (${convertErrors} failed)` : '')
 );
 
-// Step 4: Create encrypted chunks
+// Step 5: Build chunk entries from cache
+console.log('\nBuilding chunk entries from cache...');
+const entries: ChunkEntry[] = [];
+const dates: Date[] = [];
+
+for (let i = 0; i < scanned.length; i++) {
+	if (!completedSet.has(i)) continue; // skip failed conversions
+
+	const asset = scanned[i];
+	const thumbPath = join(cacheDir, thumbCacheName(i));
+	const hasAsset = asset.type === 'photo' || asset.type === 'live';
+	const hasVideo = asset.type === 'video' || asset.type === 'live';
+
+	entries.push({
+		id: i,
+		type: asset.type,
+		date: asset.date.toISOString(),
+		thumbnailPath: thumbPath,
+		assetPath: hasAsset ? join(cacheDir, assetCacheName(i)) : null,
+		videoPath: hasVideo ? join(cacheDir, videoCacheName(i)) : null
+	});
+	dates.push(asset.date);
+}
+
+// Step 6: Create encrypted chunks (reads from cache lazily)
 console.log('\nCreating encrypted chunks...');
 const chunks = await createChunks(entries, albumDir, key);
 console.log(`Created ${chunks.length} chunk(s)`);
@@ -181,12 +286,17 @@ for (const chunk of chunks) {
 	console.log(`  Chunk ${chunk.chunkId}: assets ${chunk.startIndex}-${chunk.endIndex}${videoTag}`);
 }
 
-// Step 5: Generate and encrypt manifest
+// Step 7: Generate and encrypt manifest
 console.log('\nGenerating encrypted manifest...');
 const manifest = generateManifest(dates, chunks);
 const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
 const encryptedManifest = await encrypt(key, manifestBytes);
 await Bun.write(resolve(albumDir, 'manifest.enc'), encryptedManifest);
+
+// Step 8: Clean up cache
+console.log('Cleaning up cache...');
+await rm(cacheDir, { recursive: true, force: true });
+await rm(progressPath, { force: true });
 
 console.log(
 	`\nDone! ${manifest.totalAssets} assets in ${chunks.length} chunk(s), ${manifest.months.length} month(s)`
